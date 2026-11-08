@@ -205,6 +205,9 @@ public abstract partial class TransportBase : ITransport
     [LoggerMessage(Level = LogLevel.Trace, Message = "{EndpointName} transport message parsing failed. Message: '{Message}'.")]
     private protected partial void LogTransportMessageParseFailedSensitive(string endpointName, string message, Exception exception);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "{EndpointName} transport received a message exceeding the maximum message size of {MaxMessageSize} bytes. The message was discarded.")]
+    private protected partial void LogTransportMessageTooLarge(string endpointName, long maxMessageSize);
+
     [LoggerMessage(Level = LogLevel.Information, Message = "{EndpointName} transport message reading canceled.")]
     private protected partial void LogTransportReadMessagesCancelled(string endpointName);
 

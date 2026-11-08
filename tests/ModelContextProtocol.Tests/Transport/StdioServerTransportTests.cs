@@ -1,4 +1,5 @@
 ﻿using Microsoft.Extensions.Logging;
+using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 using ModelContextProtocol.Tests.Utils;
@@ -349,6 +350,399 @@ public class StdioServerTransportTests : LoggedTest
 
         // The transport should still be reading further messages after recovering from the bad one.
         Assert.True(transport.IsConnected);
+    }
+
+    [Theory]
+    [InlineData(4 * 1024, false)]   // The whole message, newline included, arrives in a single read buffer.
+    [InlineData(512 * 1024, false)] // The message spans many read buffers and is discarded as it arrives.
+    [InlineData(512 * 1024, true)]  // As above, with "id" written before "params", as some other SDKs do.
+    public async Task ReadMessagesAsync_Should_Respond_With_InvalidRequest_For_Request_Exceeding_MaxMessageSize(int payloadSize, bool idFirst)
+    {
+        const long MaxMessageSize = 1024;
+
+        // By default this is serialized the way the C# SDK client sends it: "id" comes after the large "params",
+        // so it can only be recovered by scanning the whole message, not just its first MaxMessageSize bytes.
+        var payload = new string('A', payloadSize);
+        string oversizedLine = idFirst
+            ? $"{{\"jsonrpc\":\"2.0\",\"id\":\"too-big\",\"method\":\"tools/call\",\"params\":{{\"data\":\"{payload}\"}}}}"
+            : SerializeMessage(new JsonRpcRequest { Id = new RequestId("too-big"), Method = "tools/call", Params = new JsonObject { ["data"] = payload } });
+        Assert.True(Encoding.UTF8.GetByteCount(oversizedLine) > MaxMessageSize);
+        Assert.Equal(idFirst, oversizedLine.IndexOf("\"id\"", StringComparison.Ordinal) < oversizedLine.IndexOf("\"params\"", StringComparison.Ordinal));
+
+        await using var harness = new TransportHarness(MaxMessageSize, LoggerFactory);
+
+        var followUp = new JsonRpcRequest { Method = "test", Id = new RequestId(45) };
+        await harness.WriteAsync($"{oversizedLine}\n{SerializeMessage(followUp)}\n");
+
+        // The oversized request is answered with an invalid request error for its id.
+        var error = Assert.IsType<JsonRpcError>(await harness.ReadResponseAsync());
+        Assert.Equal(new RequestId("too-big"), error.Id);
+        Assert.Equal((int)McpErrorCode.InvalidRequest, error.Error.Code);
+
+        // The oversized message is never surfaced, and the transport keeps reading: the next message
+        // is the well-formed request that followed the discarded one.
+        var request = Assert.IsType<JsonRpcRequest>(await harness.Transport.MessageReader.ReadAsync(harness.TimeoutToken));
+        Assert.Equal(new RequestId(45), request.Id);
+        Assert.True(harness.Transport.IsConnected);
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Recover_Id_From_Oversized_Request_Written_In_Single_Bytes()
+    {
+        // Every byte arrives in its own read, so the scanner must carry its state across every possible split,
+        // including inside property names, escape sequences, and the id itself.
+        const long MaxMessageSize = 256;
+        var oversizedLine = SerializeMessage(new JsonRpcRequest
+        {
+            Id = new RequestId("split \"id\" \\ value"),
+            Method = "tools/call",
+            Params = new JsonObject { ["data"] = new string('A', 2 * 1024) },
+        });
+
+        await using var harness = new TransportHarness(MaxMessageSize, LoggerFactory);
+
+        foreach (byte b in Encoding.UTF8.GetBytes(oversizedLine + "\n"))
+        {
+            await harness.Input.Writer.WriteAsync(new[] { b }, TestContext.Current.CancellationToken);
+        }
+
+        var error = Assert.IsType<JsonRpcError>(await harness.ReadResponseAsync());
+        Assert.Equal(new RequestId("split \"id\" \\ value"), error.Id);
+        Assert.Equal((int)McpErrorCode.InvalidRequest, error.Error.Code);
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Ignore_Nested_And_Quoted_Ids_In_Oversized_Request()
+    {
+        // Only the top-level "id" identifies the request. Ids nested inside params, or that appear inside
+        // string values (including after escaped quotes), must not be mistaken for it.
+        const long MaxMessageSize = 1024;
+        var oversizedLine =
+            "{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{" +
+            "\"id\":\"nested\"," +
+            "\"items\":[{\"id\":1},{\"id\":2}]," +
+            "\"text\":\"he said \\\"id\\\":3, \\\"}\\\" and left\"," +
+            $"\"data\":\"{new string('A', 4 * 1024)}\"" +
+            "},\"id\":42}";
+
+        await using var harness = new TransportHarness(MaxMessageSize, LoggerFactory);
+        await harness.WriteAsync(oversizedLine + "\n");
+
+        var error = Assert.IsType<JsonRpcError>(await harness.ReadResponseAsync());
+        Assert.Equal(new RequestId(42), error.Id);
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Drop_Oversized_Notification_Without_Response()
+    {
+        const long MaxMessageSize = 1024;
+
+        // A notification has no id to correlate, so it is dropped without a response. The oversized
+        // request that follows proves that the first line written to the output belongs to it.
+        var oversizedNotification = SerializeMessage(new JsonRpcNotification { Method = "notifications/test", Params = new JsonObject { ["data"] = new string('A', 200 * 1024) } });
+        var oversizedRequest = SerializeMessage(new JsonRpcRequest { Id = new RequestId(7), Method = "test", Params = new JsonObject { ["data"] = new string('B', 200 * 1024) } });
+
+        await using var harness = new TransportHarness(MaxMessageSize, LoggerFactory);
+        await harness.WriteAsync($"{oversizedNotification}\n{oversizedRequest}\n");
+
+        var error = Assert.IsType<JsonRpcError>(await harness.ReadResponseAsync());
+        Assert.Equal(new RequestId(7), error.Id);
+        Assert.Equal((int)McpErrorCode.InvalidRequest, error.Error.Code);
+
+        Assert.False(harness.Transport.MessageReader.TryPeek(out _));
+        Assert.True(harness.Transport.IsConnected);
+    }
+
+    [Theory]
+    [InlineData(4 * 1024)]
+    [InlineData(512 * 1024)]
+    public async Task ReadMessagesAsync_Should_Fail_Locally_For_Response_Exceeding_MaxMessageSize(int payloadSize)
+    {
+        // An oversized response to a request the server sent (for example, a large sampling result) carries an
+        // id from the server's own id space. Replying to the client with it would be wrong, so the transport
+        // instead surfaces an error response locally so the server's pending request fails.
+        const long MaxMessageSize = 1024;
+        var oversizedResponse = SerializeMessage(new JsonRpcResponse { Id = new RequestId(5), Result = new JsonObject { ["data"] = new string('A', payloadSize) } });
+        var sentinel = SerializeMessage(new JsonRpcRequest { Id = new RequestId("sentinel"), Method = "test", Params = new JsonObject { ["data"] = new string('B', 4 * 1024) } });
+
+        await using var harness = new TransportHarness(MaxMessageSize, LoggerFactory);
+        await harness.WriteAsync($"{oversizedResponse}\n{sentinel}\n");
+
+        var localError = Assert.IsType<JsonRpcError>(await harness.Transport.MessageReader.ReadAsync(harness.TimeoutToken));
+        Assert.Equal(new RequestId(5), localError.Id);
+        Assert.Equal((int)McpErrorCode.InvalidRequest, localError.Error.Code);
+
+        // Nothing was sent to the client for the response: the first line it receives answers the sentinel.
+        var error = Assert.IsType<JsonRpcError>(await harness.ReadResponseAsync());
+        Assert.Equal(new RequestId("sentinel"), error.Id);
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Fail_Locally_For_Response_That_Fails_To_Parse()
+    {
+        // A response nested more deeply than the reader allows can't be deserialized. Like an oversized response,
+        // it must fail the server's pending request locally rather than send a parse error to the client.
+        var nested = new StringBuilder();
+        const int Depth = 100;
+        for (int i = 0; i < Depth; i++)
+        {
+            nested.Append("{\"r").Append(i).Append("\":");
+        }
+        nested.Append("true").Append('}', Depth);
+
+        var sentinel = SerializeMessage(new JsonRpcRequest { Id = new RequestId("sentinel"), Method = "test", Params = new JsonObject { ["data"] = new string('B', 4 * 1024) } });
+
+        await using var harness = new TransportHarness(maxMessageSize: 1024, LoggerFactory);
+        await harness.WriteAsync($"{{\"result\":{nested},\"id\":6,\"jsonrpc\":\"2.0\"}}\n{sentinel}\n");
+
+        var localError = Assert.IsType<JsonRpcError>(await harness.Transport.MessageReader.ReadAsync(harness.TimeoutToken));
+        Assert.Equal(new RequestId(6), localError.Id);
+        Assert.Equal((int)McpErrorCode.ParseError, localError.Error.Code);
+
+        var error = Assert.IsType<JsonRpcError>(await harness.ReadResponseAsync());
+        Assert.Equal(new RequestId("sentinel"), error.Id);
+    }
+
+    [Theory]
+    [InlineData("\n")]
+    [InlineData("\r\n")]
+    public async Task ReadMessagesAsync_Should_Accept_Message_Of_Exactly_MaxMessageSize(string newline)
+    {
+        var atLimit = SerializeMessage(new JsonRpcRequest { Id = new RequestId(1), Method = "test", Params = new JsonObject { ["data"] = new string('A', 100 * 1024) } });
+        var overLimit = SerializeMessage(new JsonRpcRequest { Id = new RequestId(2), Method = "test", Params = new JsonObject { ["data"] = new string('A', (100 * 1024) + 1) } });
+        long maxMessageSize = Encoding.UTF8.GetByteCount(atLimit);
+        Assert.Equal(maxMessageSize + 1, Encoding.UTF8.GetByteCount(overLimit));
+
+        await using var harness = new TransportHarness(maxMessageSize, LoggerFactory);
+        await harness.WriteAsync($"{atLimit}{newline}{overLimit}{newline}");
+
+        // A message of exactly MaxMessageSize bytes, not counting the line terminator, is accepted.
+        var request = Assert.IsType<JsonRpcRequest>(await harness.Transport.MessageReader.ReadAsync(harness.TimeoutToken));
+        Assert.Equal(new RequestId(1), request.Id);
+
+        // One byte more is rejected.
+        var error = Assert.IsType<JsonRpcError>(await harness.ReadResponseAsync());
+        Assert.Equal(new RequestId(2), error.Id);
+        Assert.Equal((int)McpErrorCode.InvalidRequest, error.Error.Code);
+    }
+
+    [Fact]
+    public async Task SampleAsync_Should_Fail_When_Client_Response_Exceeds_MaxMessageSize()
+    {
+        // End to end: a client's sampling result larger than the server's MaxMessageSize must fail the server's
+        // SampleAsync call instead of leaving it waiting forever for a response that was discarded.
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        cts.CancelAfter(TestConstants.DefaultTimeout);
+
+        Pipe clientToServer = new();
+        Pipe serverToClient = new();
+        await using var server = McpServer.Create(
+            new StreamServerTransport(
+                clientToServer.Reader.AsStream(),
+                serverToClient.Writer.AsStream(),
+                new StreamServerTransportOptions { MaxMessageSize = 64 * 1024 },
+                LoggerFactory),
+            new McpServerOptions(),
+            LoggerFactory);
+        Task serverTask = server.RunAsync(cts.Token);
+
+        try
+        {
+            var clientOptions = TestMcpClient.CreateOptions();
+
+            // Use a protocol version in which the server sends sampling as an ordinary request to the client.
+            clientOptions.ProtocolVersion = McpProtocolVersions.November2025ProtocolVersion;
+            clientOptions.Handlers.SamplingHandler = (_, _, _) => new ValueTask<CreateMessageResult>(new CreateMessageResult
+            {
+                Model = "test-model",
+                Role = Role.Assistant,
+                Content = [new TextContentBlock { Text = new string('A', 256 * 1024) }],
+            });
+
+            await using var client = await TestMcpClient.CreateAsync(
+                new StreamClientTransport(clientToServer.Writer.AsStream(), serverToClient.Reader.AsStream()),
+                clientOptions,
+                LoggerFactory,
+                cts.Token);
+
+            var ex = await Assert.ThrowsAsync<McpProtocolException>(async () => await server.SampleAsync(
+                new CreateMessageRequestParams
+                {
+                    Messages = [new SamplingMessage { Role = Role.User, Content = [new TextContentBlock { Text = "Hello" }] }],
+                    MaxTokens = 10,
+                },
+                cts.Token));
+            Assert.Equal(McpErrorCode.InvalidRequest, ex.ErrorCode);
+        }
+        finally
+        {
+            await cts.CancelAsync();
+            await serverTask;
+        }
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Read_Large_Message_Written_In_Chunks()
+    {
+        // Without a MaxMessageSize, a message far larger than the transport's read buffer that arrives
+        // in many small writes is reassembled intact.
+        var payload = new string('A', 1024 * 1024);
+        var message = new JsonRpcRequest { Method = "test", Id = new RequestId(46), Params = new JsonObject { ["data"] = payload } };
+        byte[] bytes = Encoding.UTF8.GetBytes(SerializeMessage(message) + "\n");
+
+        await using var harness = new TransportHarness(maxMessageSize: null, LoggerFactory);
+
+        const int ChunkSize = 7 * 1024;
+        for (int offset = 0; offset < bytes.Length; offset += ChunkSize)
+        {
+            await harness.Input.Writer.WriteAsync(bytes.AsMemory(offset, Math.Min(ChunkSize, bytes.Length - offset)), TestContext.Current.CancellationToken);
+        }
+
+        var request = Assert.IsType<JsonRpcRequest>(await harness.Transport.MessageReader.ReadAsync(harness.TimeoutToken));
+        Assert.Equal(new RequestId(46), request.Id);
+        Assert.Equal(payload, request.Params?["data"]?.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Read_Multiple_Messages_And_Skip_Blank_Lines()
+    {
+        await using var harness = new TransportHarness(maxMessageSize: null, LoggerFactory);
+
+        var first = SerializeMessage(new JsonRpcRequest { Method = "test", Id = new RequestId(1) });
+        var second = SerializeMessage(new JsonRpcNotification { Method = "notifications/test" });
+        var third = SerializeMessage(new JsonRpcRequest { Method = "test", Id = new RequestId(3) });
+        await harness.WriteAsync($"{first}\n\n   \n{second}\r\n\t\n{third}\n");
+
+        var reader = harness.Transport.MessageReader;
+        Assert.Equal(new RequestId(1), Assert.IsType<JsonRpcRequest>(await reader.ReadAsync(harness.TimeoutToken)).Id);
+        Assert.Equal("notifications/test", Assert.IsType<JsonRpcNotification>(await reader.ReadAsync(harness.TimeoutToken)).Method);
+        Assert.Equal(new RequestId(3), Assert.IsType<JsonRpcRequest>(await reader.ReadAsync(harness.TimeoutToken)).Id);
+        Assert.False(reader.TryPeek(out _));
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Skip_Leading_Utf8_Byte_Order_Mark()
+    {
+        await using var harness = new TransportHarness(maxMessageSize: null, LoggerFactory);
+
+        byte[] message = Encoding.UTF8.GetBytes(SerializeMessage(new JsonRpcRequest { Method = "test", Id = new RequestId(9) }) + "\n");
+        await harness.Input.Writer.WriteAsync(new byte[] { 0xEF, 0xBB, 0xBF }.Concat(message).ToArray(), TestContext.Current.CancellationToken);
+
+        var request = Assert.IsType<JsonRpcRequest>(await harness.Transport.MessageReader.ReadAsync(harness.TimeoutToken));
+        Assert.Equal(new RequestId(9), request.Id);
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Read_Final_Message_Without_Trailing_Newline()
+    {
+        // Like StreamReader.ReadLine, data left at the end of the stream without a newline is a final message.
+        var input = new MemoryStream(Encoding.UTF8.GetBytes(SerializeMessage(new JsonRpcRequest { Method = "test", Id = new RequestId(10) })));
+
+        await using var transport = new StreamServerTransport(input, Stream.Null, loggerFactory: LoggerFactory);
+
+        var messages = new List<JsonRpcMessage>();
+        await foreach (var message in transport.MessageReader.ReadAllAsync(TestContext.Current.CancellationToken))
+        {
+            messages.Add(message);
+        }
+
+        var request = Assert.IsType<JsonRpcRequest>(Assert.Single(messages));
+        Assert.Equal(new RequestId(10), request.Id);
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Treat_Lone_Carriage_Return_As_Whitespace()
+    {
+        // Only '\n' delimits messages. A lone '\r' is JSON whitespace within the message, not a line break.
+        await using var harness = new TransportHarness(maxMessageSize: null, LoggerFactory);
+        await harness.WriteAsync("{\"jsonrpc\":\"2.0\",\r\"id\":11,\r\"method\":\"test\"}\n");
+
+        var request = Assert.IsType<JsonRpcRequest>(await harness.Transport.MessageReader.ReadAsync(harness.TimeoutToken));
+        Assert.Equal(new RequestId(11), request.Id);
+    }
+
+    [Fact]
+    public async Task ReadMessagesAsync_Should_Respond_With_ParseError_For_Trailing_Content()
+    {
+        await using var harness = new TransportHarness(maxMessageSize: null, LoggerFactory);
+        await harness.WriteAsync("""{"jsonrpc":"2.0","id":8,"method":"ping"} {}""" + "\n");
+
+        var error = Assert.IsType<JsonRpcError>(await harness.ReadResponseAsync());
+        Assert.Equal(new RequestId(8), error.Id);
+        Assert.Equal((int)McpErrorCode.ParseError, error.Error.Code);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void StreamServerTransportOptions_MaxMessageSize_Rejects_NonPositive_Values(long maxMessageSize)
+    {
+        var options = new StreamServerTransportOptions();
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => options.MaxMessageSize = maxMessageSize);
+    }
+
+    private static string SerializeMessage(JsonRpcMessage message) =>
+        JsonSerializer.Serialize(message, McpJsonUtilities.DefaultOptions);
+
+    /// <summary>A <see cref="StreamServerTransport"/> over in-memory pipes, for writing raw input and reading raw output.</summary>
+    /// <remarks>
+    /// Reads time out after <see cref="TestConstants.DefaultTimeout"/>, so a missing message fails the test instead of hanging it.
+    /// </remarks>
+    private sealed class TransportHarness : IAsyncDisposable
+    {
+        private readonly CancellationTokenSource _timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        private readonly Stream _input;
+        private readonly StreamReader _output;
+
+        public TransportHarness(long? maxMessageSize, ILoggerFactory loggerFactory)
+        {
+            _timeoutCts.CancelAfter(TestConstants.DefaultTimeout);
+
+            // Ending the output on timeout makes a pending ReadResponseAsync return no line, on every target framework.
+            _timeoutCts.Token.Register(() => Output.Writer.Complete());
+
+            _input = Input.Reader.AsStream();
+            _output = new StreamReader(Output.Reader.AsStream(), Encoding.UTF8);
+            Transport = new StreamServerTransport(
+                _input,
+                Output.Writer.AsStream(),
+                new StreamServerTransportOptions { MaxMessageSize = maxMessageSize },
+                loggerFactory);
+        }
+
+        public Pipe Input { get; } = new();
+
+        public Pipe Output { get; } = new();
+
+        public StreamServerTransport Transport { get; }
+
+        /// <summary>Gets a token that is canceled when the test times out.</summary>
+        public CancellationToken TimeoutToken => _timeoutCts.Token;
+
+        public async Task WriteAsync(string text) =>
+            await Input.Writer.WriteAsync(Encoding.UTF8.GetBytes(text), TestContext.Current.CancellationToken);
+
+        /// <summary>Reads the next message the transport wrote to its output.</summary>
+        public async Task<JsonRpcMessage?> ReadResponseAsync()
+        {
+            var line = await _output.ReadLineAsync(
+#if NET
+                TestContext.Current.CancellationToken
+#endif
+            );
+
+            Assert.True(line is not null, "Timed out waiting for the transport to write a message.");
+            return JsonSerializer.Deserialize<JsonRpcMessage>(line!, McpJsonUtilities.DefaultOptions);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _timeoutCts.Dispose();
+            await Transport.DisposeAsync();
+            _output.Dispose();
+            _input.Dispose();
+        }
     }
 
     [Fact]
